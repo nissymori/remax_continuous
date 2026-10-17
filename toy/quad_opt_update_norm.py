@@ -1,0 +1,502 @@
+import argparse
+import os
+import re
+from functools import partial
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+import jax
+import jax.numpy as jnp
+import matplotlib as mpl
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["cmr10", "Computer Modern Roman", "DejaVu Serif"],
+    "mathtext.fontset": "cm",
+    "mathtext.rm": "serif",
+    "axes.formatter.use_mathtext": True,
+    "axes.unicode_minus": False,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+from remax import compute_batch_remax
+
+jax.config.update("jax_enable_x64", True)
+
+# -----------------------------
+# Toy env / objective
+# -----------------------------
+def quad(x: jnp.ndarray) -> jnp.ndarray:
+    return -x**2
+
+
+def sample_actions(key: jax.Array, mu: jnp.ndarray, sigma: jnp.ndarray, batch_size: int) -> jnp.ndarray:
+    eps = jax.random.normal(key, shape=(batch_size,))
+    return mu + sigma * eps
+
+
+def reparam_objective(mu: jnp.ndarray, sigma: jnp.ndarray, key: jax.Array, batch_size: int, m: int) -> jnp.ndarray:
+    actions = sample_actions(key, mu, sigma, batch_size)
+    returns = quad(actions)
+    return compute_batch_remax(returns, m)
+
+
+# -----------------------------
+# Reparam gradient (JAX autodiff)
+# -----------------------------
+@partial(jax.jit, static_argnames=("batch_size", "m"))
+def reparam_grad_remax(mu, sigma, key, batch_size, m):
+    grad_fn = jax.grad(reparam_objective, argnums=(0, 1))
+    dmu, dsigma = grad_fn(mu, sigma, key, batch_size, m)
+    return jnp.array([dmu, dsigma])
+
+
+# -----------------------------
+# Optimizers
+# -----------------------------
+class SGD:
+    def __init__(self, lr: float):
+        self.lr = lr
+
+    def update(self, params, grads):
+        return self.lr * grads
+
+
+class Adam:
+    def __init__(self, lr: float, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m = None
+        self.v = None
+        self.t = 0
+
+    def step(self, params, grads):
+        """
+        Returns:
+          delta: update amount (same shape as params)
+          m_hat: bias-corrected first moment
+          v_hat: bias-corrected second moment
+          precond: m_hat / (sqrt(v_hat) + eps)   (i.e., delta / lr)
+        """
+        if self.m is None:
+            self.m = np.zeros_like(params)
+            self.v = np.zeros_like(params)
+
+        self.t += 1
+        self.m = self.beta1 * self.m + (1 - self.beta1) * grads
+        self.v = self.beta2 * self.v + (1 - self.beta2) * (grads**2)
+
+        m_hat = self.m / (1 - self.beta1**self.t)
+        v_hat = self.v / (1 - self.beta2**self.t)
+
+        precond = m_hat / (np.sqrt(v_hat) + self.eps)
+        delta = self.lr * precond
+        return delta, m_hat, v_hat, precond
+
+
+# -----------------------------
+# Simulation
+# -----------------------------
+def simulate_path(
+    optimizer: str,
+    lr: float,
+    steps: int,
+    start_mu: float,
+    start_sigma: float,
+    batch_size: int,
+    m: int,
+    seed: int,
+    actor_epsilon: float,
+    beta1: float,
+    beta2: float,
+):
+    key = jax.random.PRNGKey(seed)
+    params = np.array([start_mu, start_sigma], dtype=np.float64)
+
+    optimizer = optimizer.lower()
+    if optimizer == "sgd":
+        opt = SGD(lr)
+        is_adam = False
+    elif optimizer == "adam":
+        opt = Adam(lr, beta1=beta1, beta2=beta2, eps=actor_epsilon)
+        is_adam = True
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer} (use 'sgd' or 'adam')")
+
+    mu_hist = [params[0]]
+    sigma_hist = [params[1]]
+    dmu_hist, dsigma_hist, dtheta_norm_hist = [], [], []
+    grad_norm_hist = []
+
+    mhat_hist = []
+    vhat_hist = []
+    precond_hist = []
+
+    for _ in range(steps):
+        mu, sigma = params
+
+        key, subkey = jax.random.split(key)
+        grads = reparam_grad_remax(mu, sigma, subkey, batch_size, m)
+        grads_np = np.array(grads, dtype=np.float64)
+        grad_norm_hist.append(float(np.linalg.norm(grads_np)))
+
+        if is_adam:
+            delta, m_hat, v_hat, precond = opt.step(params, grads_np)
+            mhat_hist.append(m_hat.copy())
+            vhat_hist.append(v_hat.copy())
+            precond_hist.append(precond.copy())
+        else:
+            delta = opt.update(params, grads_np)
+
+        new_params = params + delta
+        new_params[1] = max(new_params[1], 1e-4)
+
+        dmu = new_params[0] - params[0]
+        dsigma = new_params[1] - params[1]
+        dtheta_norm = float(np.sqrt(dmu**2 + dsigma**2))
+
+        dmu_hist.append(dmu)
+        dsigma_hist.append(dsigma)
+        dtheta_norm_hist.append(dtheta_norm)
+
+        params = new_params
+        mu_hist.append(params[0])
+        sigma_hist.append(params[1])
+
+    out = {
+        "mu": np.array(mu_hist),
+        "sigma": np.array(sigma_hist),
+        "dmu": np.array(dmu_hist),
+        "dsigma": np.array(dsigma_hist),
+        "dnorm": np.array(dtheta_norm_hist),
+        "grad_norm": np.array(grad_norm_hist),
+        "is_adam": is_adam,
+    }
+    if is_adam:
+        out["mhat"] = np.array(mhat_hist)
+        out["vhat"] = np.array(vhat_hist)
+        out["precond"] = np.array(precond_hist)
+
+    out["dist"] = np.sqrt(out["mu"] ** 2 + out["sigma"] ** 2)
+    return out
+
+
+# -----------------------------
+# Parsing helpers
+# -----------------------------
+def _parse_float_list(csv: str):
+    toks = [t for t in re.split(r"[,\s]+", csv.strip()) if t]
+    xs = [float(t) for t in toks]
+    if len(xs) == 0:
+        raise ValueError("Expected at least one float, e.g. 1e-8 or 1e-8,1e-6,1e-4")
+    return xs
+
+
+def _eps_tag(eps: float) -> str:
+    return f"{eps:.0e}".replace("+", "")
+
+
+def _fmt_eps(eps: float) -> str:
+    """Format epsilon for legend labels, e.g. 1e-08 -> 1e-8."""
+    s = f"{eps:g}"
+    return re.sub(r"e([+-])0*(\d)", r"e\1\2", s).replace("e+", "e")
+
+
+def _derive_sibling_savepath(savepath: str, suffix: str) -> str:
+    root, ext = os.path.splitext(savepath)
+    if not ext:
+        ext = ".pdf"
+    return f"{root}_{suffix}{ext}"
+
+
+# -----------------------------
+# Plot: multi epsilon (ADAM runs) + SGD baseline (gray)
+# -----------------------------
+def plot_distance_only(results_adam, actor_epsilons, *, m: int, savepath: str, sgd_baseline=None, plot_legend=True, add_y_label=False):
+    fig, ax = plt.subplots(figsize=(5.7, 5))
+
+    if sgd_baseline is not None:
+        it_params = np.arange(len(sgd_baseline["dist"]))
+        ax.plot(it_params, sgd_baseline["dist"], color="0.5", linewidth=2.8, alpha=0.95, label="SGD")
+
+    cmap = plt.get_cmap("tab10")
+    linestyles = ["-", "--", "-.", ":"]
+    markers = ["o", "s", "^", "D", "x", "+", "v", "<", ">", "*"]
+
+    for i, (eps, res) in enumerate(zip(actor_epsilons, results_adam)):
+        color = cmap(i % 10)
+        ls = linestyles[i % len(linestyles)]
+        mk = markers[i % len(markers)]
+        it_params = np.arange(len(res["dist"]))
+        ax.plot(
+            it_params,
+            res["dist"],
+            color=color,
+            linestyle=ls,
+            linewidth=3.0,
+            marker=mk,
+            markersize=5,
+            markevery=max(1, len(it_params) // 12),
+            label=rf"Adam $\epsilon={_fmt_eps(eps)}$",
+            alpha=0.95,
+        )
+
+    ax.set_yscale("log")
+    ax.set_xlabel("iteration", fontsize=23)
+    if add_y_label:
+        ax.set_ylabel(r"$\|\theta_t-\theta^\star\|_2$", fontsize=23)
+    ax.set_xticks([0, 200, 400, 600, 800, 1000])
+    ax.set_yticks([1e-4, 1e-3, 1e-2, 1e-1, 1e0])
+    ax.tick_params(axis="both", which="major", labelsize=16)
+
+    ax.set_title(f"M={m}", fontsize=25)
+    ax.grid(True, which="both", alpha=0.25)
+    # Keep the axes box square regardless of y-label / legend / colorbar.
+    ax.set_box_aspect(1)
+    if plot_legend:
+        ax.legend(fontsize=15, ncol=1, frameon=False)
+
+    fig.tight_layout()
+    out_dir = os.path.dirname(savepath)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(savepath, dpi=300, bbox_inches="tight")
+    print(f"Saved: {savepath}")
+    plt.close(fig)
+
+
+# -----------------------------
+# Plot: optimization-path-only (mu vs sigma)
+# -----------------------------
+def optimization_path_only(
+    results_adam,
+    actor_epsilons,
+    *,
+    m: int,
+    savepath: str,
+    plot_legend: bool = True,
+    sgd_baseline=None,
+    add_y_label=False,
+):
+    if len(results_adam) == 0:
+        raise ValueError("results_adam must be non-empty")
+
+    fig, ax = plt.subplots(figsize=(5.2, 5.2))
+
+    # background contours
+    all_mu = np.concatenate([res["mu"] for res in results_adam] + ([sgd_baseline["mu"]] if sgd_baseline else []))
+    all_sigma = np.concatenate([res["sigma"] for res in results_adam] + ([sgd_baseline["sigma"]] if sgd_baseline else []))
+
+    x_min = np.min(all_mu) - 0.6
+    x_max = np.max(all_mu) + 0.6
+    y_min = max(0.0, np.min(all_sigma) - 0.35)
+    y_max = np.max(all_sigma) + 0.35
+
+    x = np.linspace(x_min, x_max, 140)
+    y = np.linspace(y_min, y_max, 140)
+    X, Y = np.meshgrid(x, y)
+    Z = -(X**2 + Y**2)
+    ax.contourf(X, Y, Z, levels=18, cmap="Greys", alpha=0.25)
+    ax.contour(X, Y, Z, levels=18, colors="k", alpha=0.12, linewidths=0.6)
+
+    # SGD
+    if sgd_baseline is not None:
+        mu_hist = sgd_baseline["mu"]
+        sigma_hist = sgd_baseline["sigma"]
+        ax.plot(mu_hist, sigma_hist, color="0.5", linewidth=2.6, alpha=0.95, label="SGD")
+        ax.plot(mu_hist[0], sigma_hist[0], marker="o", color="0.5", markersize=5, alpha=0.95)
+
+    # Adam
+    cmap = plt.get_cmap("tab10")
+    linestyles = ["-", "--", "-.", ":"]
+    markers = ["o", "s", "^", "D", "x", "+", "v", "<", ">", "*"]
+
+    for i, (eps, res) in enumerate(zip(actor_epsilons, results_adam)):
+        color = cmap(i % 10)
+        ls = linestyles[i % len(linestyles)]
+        mk = markers[i % len(markers)]
+        mu_hist = res["mu"]
+        sigma_hist = res["sigma"]
+
+        ax.plot(
+            mu_hist,
+            sigma_hist,
+            color=color,
+            linestyle=ls,
+            linewidth=3,
+            alpha=0.95,
+            label=rf"Adam $\epsilon={_fmt_eps(eps)}$",
+        )
+        ax.plot(mu_hist[0], sigma_hist[0], marker=mk, color=color, markersize=5, alpha=0.95)
+        ax.plot(mu_hist[-1], sigma_hist[-1], marker=".", color=color, markersize=6, alpha=0.95)
+
+    ax.plot(0.0, 0.0, marker="x", markersize=9, color="r", label="Optimum")
+
+    ax.set_xlabel(r"$\mu$", fontsize=30)
+    if add_y_label:
+        ax.set_ylabel(r"$\sigma$", fontsize=30)
+    ax.set_title(f"M={m}", fontsize=25)
+
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.grid(True, alpha=0.25)
+    ax.tick_params(axis="both", which="major", labelsize=20)
+    # Keep the axes box square regardless of y-label / legend / colorbar.
+    ax.set_box_aspect(1)
+
+    if plot_legend:
+        ax.legend(fontsize=12, frameon=False, loc="best")
+
+    fig.tight_layout()
+    out_dir = os.path.dirname(savepath)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(savepath, dpi=300, bbox_inches="tight")
+    print(f"Saved: {savepath}")
+    plt.close(fig)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--steps", type=int, default=1000)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--m", type=int, default=8)
+    p.add_argument("--seed", type=int, default=0)
+
+    p.add_argument("--start-mu", type=float, default=-1.5)
+    p.add_argument("--start-sigma", type=float, default=1.0)
+
+    p.add_argument("--lr", type=float, default=0.01)
+
+    # Adam knobs
+    p.add_argument(
+        "--actor-epsilon",
+        type=str,
+        default="1e-8,1e-1,1.0",
+        help="Comma/space-separated list, e.g. '1e-8,1e-6,1e-4'",
+    )
+    p.add_argument("--beta1", type=float, default=0.9)
+    p.add_argument("--beta2", type=float, default=0.999)
+
+    # SGD baseline lr
+    p.add_argument("--lr-sgd", type=float, default=None, help="If set, use this lr for SGD baseline; else use --lr.")
+
+    # plot controls
+    p.add_argument("--save", type=str, default="", help="Main multi-panel save path (default: fig/...pdf)")
+    p.add_argument("--save-distance", type=str, default="", help="Distance-only save path (default: derived)")
+    p.add_argument("--save-opt-path", type=str, default="", help="Opt-path-only save path (default: derived)")
+
+    # NEW: choose what to plot
+    p.add_argument("--distance-only", action="store_true", help="Only plot distance-only figure")
+    p.add_argument("--optimize-only", action="store_true", help="Only plot optimization-path-only figure")
+    p.add_argument("--no-legend", action="store_true", help="Hide legends (paper)")
+    p.add_argument("--add-y-label", action="store_true", help="Add y-axis label")
+
+    args = p.parse_args()
+
+    actor_epsilons = _parse_float_list(args.actor_epsilon)
+
+    os.makedirs("fig", exist_ok=True)
+
+    lr_sgd = args.lr if args.lr_sgd is None else args.lr_sgd
+    sgd_baseline = simulate_path(
+        optimizer="sgd",
+        lr=lr_sgd,
+        steps=args.steps,
+        start_mu=args.start_mu,
+        start_sigma=args.start_sigma,
+        batch_size=args.batch_size,
+        m=args.m,
+        seed=args.seed,
+        actor_epsilon=1e-8,  # ignored for SGD
+        beta1=args.beta1,
+        beta2=args.beta2,
+    )
+
+    results_adam = []
+    for eps in actor_epsilons:
+        res = simulate_path(
+            optimizer="adam",
+            lr=args.lr,
+            steps=args.steps,
+            start_mu=args.start_mu,
+            start_sigma=args.start_sigma,
+            batch_size=args.batch_size,
+            m=args.m,
+            seed=args.seed,
+            actor_epsilon=eps,
+            beta1=args.beta1,
+            beta2=args.beta2,
+        )
+        results_adam.append(res)
+
+    # save paths (default: pdf)
+    if args.save.strip():
+        savepath = args.save.strip()
+    else:
+        if len(actor_epsilons) == 1:
+            savepath = f"fig/remax_paths_M{args.m}_adam_eps_{actor_epsilons[0]:g}_lr_{args.lr}.pdf"
+        else:
+            eps_slug = "_".join([_eps_tag(eps) for eps in actor_epsilons])
+            savepath = f"fig/remax_paths_M{args.m}_adam_eps_multi_{eps_slug}_lr_{args.lr}.pdf"
+
+    distance_savepath = args.save_distance.strip() or _derive_sibling_savepath(savepath, "distance_only")
+    opt_path_savepath = args.save_opt_path.strip() or _derive_sibling_savepath(savepath, "opt_path_only")
+
+    plot_legend = (not args.no_legend)
+
+    # dispatch
+    if args.distance_only and args.optimize_only:
+        plot_distance_only(
+            results_adam,
+            actor_epsilons=actor_epsilons,
+            m=args.m,
+            savepath=distance_savepath,
+            sgd_baseline=sgd_baseline,
+            plot_legend=plot_legend,
+            add_y_label=args.add_y_label,
+        )
+        optimization_path_only(
+            results_adam,
+            actor_epsilons=actor_epsilons,
+            m=args.m,
+            savepath=opt_path_savepath,
+            plot_legend=plot_legend,
+            sgd_baseline=sgd_baseline,
+            add_y_label=args.add_y_label,
+        )
+        return
+
+    if args.distance_only:
+        plot_distance_only(
+            results_adam,
+            actor_epsilons=actor_epsilons,
+            m=args.m,
+            savepath=distance_savepath,
+            sgd_baseline=sgd_baseline,
+            plot_legend=plot_legend,
+            add_y_label=args.add_y_label,
+        )
+        return
+
+    if args.optimize_only:
+        optimization_path_only(
+            results_adam,
+            actor_epsilons=actor_epsilons,
+            m=args.m,
+            savepath=opt_path_savepath,
+            plot_legend=plot_legend,
+            sgd_baseline=sgd_baseline,
+            add_y_label=args.add_y_label,
+        )
+        return
+
+if __name__ == "__main__":
+    main()

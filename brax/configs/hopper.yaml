@@ -1,0 +1,55 @@
+sac:
+  env: brax/hopper
+  agent_kwargs:
+    activation: tanh
+  num_envs: 128
+  buffer_size: 1000000
+  fill_buffer: 10000
+  batch_size: 128
+  learning_rate: 0.0005720796166976961
+  num_epochs: 128
+  total_timesteps: 3000000
+  eval_freq: 30000
+  gamma: 0.995
+  polyak: 0.95
+  target_entropy_ratio: 0
+  normalize_observations: true
+
+remax_ac:
+  env: brax/hopper
+  agent_kwargs:
+    activation: tanh
+  num_envs: 128
+  buffer_size: 1000000
+  fill_buffer: 10000
+  batch_size: 128
+  learning_rate: 0.0003
+  num_epochs: 128
+  total_timesteps: 3000000
+  eval_freq: 30000
+  gamma: 0.995
+  polyak: 0.95
+  target_entropy_ratio: 0
+  normalize_observations: true
+  remax_num_samples: 8
+  remax_m: 4
+  actor_epsilon: 1.0e-8
+
+ppo:
+  env: brax/hopper
+  agent_kwargs:
+    activation: tanh
+  num_envs: 32
+  num_steps: 32
+  num_epochs: 9
+  num_minibatches: 2
+  learning_rate: 0.00025674088686342003
+  max_grad_norm: 1
+  total_timesteps: 3000000
+  eval_freq: 30000
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  normalize_observations: true

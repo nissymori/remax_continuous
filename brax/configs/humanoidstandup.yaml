@@ -1,0 +1,55 @@
+sac:
+  env: brax/humanoidstandup
+  agent_kwargs:
+    activation: tanh
+  num_envs: 128
+  buffer_size: 1048576
+  fill_buffer: 8192
+  batch_size: 256
+  learning_rate: 0.00020366442026830908
+  num_epochs: 128
+  total_timesteps: 3000000
+  eval_freq: 30000
+  gamma: 0.99
+  polyak: 0.99
+  target_entropy_ratio: 0
+  normalize_observations: true
+
+remax_ac:
+  env: brax/humanoidstandup
+  agent_kwargs:
+    activation: tanh
+  num_envs: 128
+  buffer_size: 1048576
+  fill_buffer: 8192
+  batch_size: 256
+  learning_rate: 0.0001
+  num_epochs: 128
+  total_timesteps: 3000000
+  eval_freq: 30000
+  gamma: 0.99
+  polyak: 0.99
+  target_entropy_ratio: 0
+  normalize_observations: true
+  remax_num_samples: 8
+  remax_m: 4
+  actor_epsilon: 1.0e-8
+
+ppo:
+  env: brax/humanoidstandup
+  agent_kwargs:
+    activation: tanh
+  num_envs: 32
+  num_steps: 32
+  num_epochs: 2
+  num_minibatches: 2
+  learning_rate: 0.0017203361125365498
+  max_grad_norm: 5
+  total_timesteps: 3000000
+  eval_freq: 30000
+  gamma: 0.99
+  gae_lambda: 0.8
+  clip_eps: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  normalize_observations: true

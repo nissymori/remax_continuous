@@ -1,0 +1,40 @@
+sac:
+  env: brax/sparse_reacher
+  env_params:
+    episode_length: 50
+  agent_kwargs:
+    activation: tanh
+  num_envs: 128
+  buffer_size: 1000000
+  fill_buffer: 10000
+  batch_size: 512
+  learning_rate: 0.0004617429169256732
+  num_epochs: 128
+  total_timesteps: 3000000
+  eval_freq: 30000
+  gamma: 0.95
+  polyak: 0.99
+  target_entropy_ratio: 0
+  normalize_observations: true
+
+remax_ac:
+  env: brax/sparse_reacher
+  agent_kwargs:
+    activation: tanh
+  num_envs: 128
+  buffer_size: 1000000
+  fill_buffer: 10000
+  batch_size: 512
+  learning_rate: 0.0005
+  num_epochs: 128
+  total_timesteps: 3000000
+  eval_freq: 30000
+  gamma: 0.95
+  polyak: 0.99
+  target_entropy_ratio: 0
+  normalize_observations: true
+  remax_num_samples: 8
+  remax_m: 4
+  actor_epsilon: 1.0e-8
+  env_params:
+    episode_length: 50
