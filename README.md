@@ -66,4 +66,3 @@ bash scripts/toy.sh   # Figs. 1, 2, 5, 6 and Tab. 1, into toy/fig/
   url     = {https://openreview.net/forum?id=qmCljotj08}
 }
 ```
-# remax_continuous
